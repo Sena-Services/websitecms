@@ -17,6 +17,7 @@ SEARCH_FIELDS = [
 	"featured",
 	"author",
 	"install_count",
+	"image",
 ]
 
 _ORDER_FIELDS = {
@@ -28,52 +29,35 @@ _ORDER_FIELDS = {
 }
 
 EXTENSION_MAP = {
-	"Cluster": "Registry Cluster",
-	"Team": "Registry Team",
 	"Agent": "Registry Agent",
 	"Tool": "Registry Tool",
 	"Skill": "Registry Skill",
 	"UI": "Registry UI",
 	"Logic": "Registry Logic",
-	"Agent Template": "Registry Agent Template",
-	"Team Template": "Registry Team Template",
 }
 
 EXTENSION_CHILDREN = {
-	"Registry Cluster": ["cluster_teams"],
-	"Registry Team": ["members"],
 	"Registry Agent": ["agent_tools", "agent_skills"],
-	"Registry Team Template": ["role_configs"],
 }
 
 # Direct link fields on extension DocTypes that point to other extensions
 _EXT_LINK_FIELDS = {
 	"Registry Agent": {
-		"agent_role": "Registry Agent Template",
 		"ui": "Registry UI",
 		"logic": "Registry Logic",
-	},
-	"Registry Team": {
-		"team_type": "Registry Team Template",
 	},
 }
 
 # Link fields on child table rows that point to extension DocTypes
 _CHILD_LINK_FIELDS = {
-	"Registry Cluster Team": {"team": "Registry Team"},
-	"Registry Team Member": {"role": "Registry Agent Template", "agent": "Registry Agent"},
 	"Registry Agent Tool": {"tool": "Registry Tool"},
 	"Registry Agent Skill": {"skill": "Registry Skill"},
-	"Registry Team Template Role Config": {"role": "Registry Agent Template"},
 }
 
 # Map child table fieldname -> child DocType
 _CHILD_TABLE_DOCTYPES = {
-	"cluster_teams": "Registry Cluster Team",
-	"members": "Registry Team Member",
 	"agent_tools": "Registry Agent Tool",
 	"agent_skills": "Registry Agent Skill",
-	"role_configs": "Registry Team Template Role Config",
 }
 
 
@@ -219,7 +203,8 @@ def _like_search(q, tags, filters, order_by, limit, offset):
 
 	sql = f"""
 		SELECT DISTINCT r.name, r.slug, r.title, r.item_type, r.category,
-			r.description, r.trust_status, r.featured, r.author, r.install_count
+			r.description, r.trust_status, r.featured, r.author, r.install_count,
+			r.image
 		FROM `tabRegistry` r
 		LEFT JOIN `tabRegistry Tag` rt_search ON rt_search.parent = r.name
 		WHERE {where}
@@ -338,16 +323,12 @@ def _resolve_to_registry(ext_doctype, ext_name):
 _CHILD_PARENT_MAP = {
 	"Registry Tool": [("Registry Agent Tool", "tool", "Registry Agent")],
 	"Registry Skill": [("Registry Agent Skill", "skill", "Registry Agent")],
-	"Registry Agent": [("Registry Team Member", "agent", "Registry Team")],
-	"Registry Team": [("Registry Cluster Team", "team", "Registry Cluster")],
 }
 
 # Direct-field reverse: extension_doctype -> [(field, parent_extension_doctype)]
 _DIRECT_PARENT_MAP = {
 	"Registry UI": [("ui", "Registry Agent")],
 	"Registry Logic": [("logic", "Registry Agent")],
-	"Registry Agent Template": [("agent_role", "Registry Agent")],
-	"Registry Team Template": [("team_type", "Registry Team")],
 }
 
 
@@ -406,8 +387,7 @@ def _get_parents(item_type, ref_name):
 # ---------------------------------------------------------------------------
 
 INSTALL_ORDER = {
-	"Agent Template": 1, "Skill": 2, "Tool": 3, "UI": 4, "Logic": 5,
-	"Team Template": 6, "Agent": 7, "Team": 8, "Cluster": 9,
+	"Skill": 1, "Tool": 2, "UI": 3, "Logic": 4, "Agent": 5,
 }
 
 
@@ -551,3 +531,211 @@ def _ext_to_slug(ext_doctype: str, ext_name: str) -> str | None:
 	if not reg_name:
 		return None
 	return frappe.db.get_value("Registry", reg_name, "slug")
+
+
+# ---------------------------------------------------------------------------
+# Publish (create/update registry items from tenant)
+# ---------------------------------------------------------------------------
+
+@frappe.whitelist(methods=["POST"])
+def publish_item(payload=None):
+	"""Create or update a Registry doc + extension from a tenant publish request.
+
+	Payload shape:
+		{
+			"item_type": "Tool"|"Skill"|"UI"|"Logic"|"Agent",
+			"title": str,
+			"description": str,
+			"slug": str (optional — if set, triggers update path),
+			"version": str (optional),
+			"author": str (optional),
+			"extension": { ... type-specific fields ... }
+		}
+	"""
+	if isinstance(payload, str):
+		import json
+		payload = json.loads(payload)
+	if not payload:
+		payload = frappe.parse_json(frappe.request.data) if frappe.request else {}
+
+	item_type = payload.get("item_type")
+	title = payload.get("title")
+	extension = payload.get("extension", {})
+
+	if not item_type or not title:
+		frappe.throw("item_type and title are required")
+
+	from senaerp_platform.registry.doctype.registry.registry import EXTENSION_MAP
+	if item_type not in EXTENSION_MAP:
+		frappe.throw(f"Invalid item_type: {item_type}")
+
+	slug = payload.get("slug")
+	action = "created"
+
+	if slug:
+		# Update path: find existing registry doc by slug
+		reg_name = frappe.db.get_value("Registry", {"slug": slug}, "name")
+		if not reg_name:
+			frappe.throw(f"Registry item with slug '{slug}' not found")
+		reg = frappe.get_doc("Registry", reg_name)
+		reg.title = title
+		reg.description = payload.get("description", reg.description)
+		if payload.get("version"):
+			reg.version = payload["version"]
+		if payload.get("author"):
+			reg.author = payload["author"]
+		reg.save(ignore_permissions=True)
+		action = "updated"
+	else:
+		# Check if a matching Registry item already exists (upsert semantics)
+		existing_name = _find_existing_registry(item_type, title, extension)
+		if existing_name:
+			reg = frappe.get_doc("Registry", existing_name)
+			reg.title = title
+			reg.description = payload.get("description", reg.description)
+			if payload.get("version"):
+				reg.version = payload["version"]
+			if payload.get("author"):
+				reg.author = payload["author"]
+			reg.save(ignore_permissions=True)
+			action = "updated"
+		else:
+			# Create path
+			reg = frappe.new_doc("Registry")
+			reg.title = title
+			reg.item_type = item_type
+			reg.description = payload.get("description", "")
+			reg.trust_status = "approved"
+			if payload.get("version"):
+				reg.version = payload["version"]
+			if payload.get("author"):
+				reg.author = payload["author"]
+			reg.insert(ignore_permissions=True)
+			# after_insert creates the extension doc and sets ref_name
+
+	# Populate extension fields
+	ext_doctype = EXTENSION_MAP[item_type][0]
+	if reg.ref_name:
+		ext = frappe.get_doc(ext_doctype, reg.ref_name)
+		_populate_extension(ext, extension, item_type)
+		ext.save(ignore_permissions=True)
+
+	frappe.db.commit()
+
+	return {
+		"slug": reg.slug,
+		"ref_name": reg.ref_name,
+		"action": action,
+	}
+
+
+# Unique key fields on extension DocTypes used for upsert matching
+_EXT_UNIQUE_KEYS = {
+	"Tool": ("Registry Tool", "tool_name"),
+	"Skill": None,  # no unique key beyond title
+	"UI": None,
+	"Logic": None,
+	"Agent": None,
+}
+
+
+def _find_existing_registry(item_type: str, title: str, extension: dict) -> str | None:
+	"""Find an existing Registry doc by title or extension unique key."""
+	# First try exact title + item_type match
+	name = frappe.db.get_value("Registry", {"title": title, "item_type": item_type}, "name")
+	if name:
+		return name
+
+	# Try matching via extension unique key (e.g. tool_name for Tool)
+	key_info = _EXT_UNIQUE_KEYS.get(item_type)
+	if key_info and extension:
+		ext_doctype, key_field = key_info
+		key_value = extension.get(key_field)
+		if key_value:
+			ref_name = frappe.db.get_value(ext_doctype, {key_field: key_value}, "registry")
+			if ref_name:
+				return ref_name
+
+	return None
+
+
+def _populate_extension(ext, data: dict, item_type: str) -> None:
+	"""Set extension fields from publish payload data."""
+
+	if item_type == "Tool":
+		for field in ("tool_name", "tool_class", "description", "instructions",
+					  "handler_path", "handler_source", "parameters_schema", "requires_config"):
+			if data.get(field) is not None:
+				ext.set(field, data[field])
+
+	elif item_type == "Skill":
+		for field in ("skill_type", "skill_content"):
+			if data.get(field) is not None:
+				ext.set(field, data[field])
+
+	elif item_type == "UI":
+		for field in ("ui_mode", "framework", "route", "source_path",
+					  "source_url", "source_ref"):
+			if data.get(field) is not None:
+				ext.set(field, data[field])
+
+	elif item_type == "Logic":
+		for field in ("module_name", "tier", "logic_doctypes", "source_path",
+					  "source_url", "source_ref"):
+			if data.get(field) is not None:
+				ext.set(field, data[field])
+
+	elif item_type == "Agent":
+		for field in ("is_system", "model", "selectable_models", "failover_chain",
+					  "temperature", "max_turns", "thinking_mode", "thinking_budget"):
+			if data.get(field) is not None:
+				ext.set(field, data[field])
+
+		# Resolve UI slug → Registry UI extension name
+		ui_slug = data.get("ui_slug")
+		if ui_slug:
+			ref_name = frappe.db.get_value(
+				"Registry", {"slug": ui_slug, "item_type": "UI"}, "ref_name"
+			)
+			if ref_name:
+				ext.set("ui", ref_name)
+
+		# Resolve Logic slug → Registry Logic extension name
+		logic_slug = data.get("logic_slug")
+		if logic_slug:
+			ref_name = frappe.db.get_value(
+				"Registry", {"slug": logic_slug, "item_type": "Logic"}, "ref_name"
+			)
+			if ref_name:
+				ext.set("logic", ref_name)
+
+		# Resolve agent_tools child table
+		if data.get("agent_tools"):
+			ext.set("agent_tools", [])
+			for row in data["agent_tools"]:
+				tool_slug = row.get("tool_slug")
+				if tool_slug:
+					ref_name = frappe.db.get_value(
+						"Registry", {"slug": tool_slug, "item_type": "Tool"}, "ref_name"
+					)
+					if ref_name:
+						ext.append("agent_tools", {
+							"tool": ref_name,
+							"enabled": row.get("enabled", 1),
+						})
+
+		# Resolve agent_skills child table
+		if data.get("agent_skills"):
+			ext.set("agent_skills", [])
+			for row in data["agent_skills"]:
+				skill_slug = row.get("skill_slug")
+				if skill_slug:
+					ref_name = frappe.db.get_value(
+						"Registry", {"slug": skill_slug, "item_type": "Skill"}, "ref_name"
+					)
+					if ref_name:
+						ext.append("agent_skills", {
+							"skill": ref_name,
+							"activation": row.get("activation", "core"),
+							"enabled": row.get("enabled", 1),
+						})

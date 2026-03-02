@@ -6,15 +6,11 @@ from frappe.model.document import Document
 
 # Maps item_type → (extension DocType name, autoname prefix)
 EXTENSION_MAP = {
-	"Cluster": ("Registry Cluster", "RC-.#####"),
-	"Team": ("Registry Team", "RT-.#####"),
 	"Agent": ("Registry Agent", "RA-.#####"),
 	"Tool": ("Registry Tool", "RTOOL-.#####"),
 	"Skill": ("Registry Skill", "RS-.#####"),
 	"UI": ("Registry UI", "RUI-.#####"),
 	"Logic": ("Registry Logic", "RL-.#####"),
-	"Agent Template": ("Registry Agent Template", "RTEMPL-.#####"),
-	"Team Template": ("Registry Team Template", "RTTEMPL-.#####"),
 }
 
 
